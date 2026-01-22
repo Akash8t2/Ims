@@ -25,11 +25,14 @@ time.sleep(1)
 mongo = MongoClient(MONGO_DB_URI)
 db = mongo[DB_NAME]
 
-numbers = db.numbers
-user_numbers = db.user_numbers
-otps = db.otps
-admins = db.admins
-chats = db.chats
+numbers = db.numbers          # {country, number, added_at}
+user_numbers = db.user_numbers # {number, user_id, country}
+otps = db.otps               # {number, otp, service, country, date, message, sent}
+admins = db.admins           # {user_id}
+chats = db.chats             # {chat_id}
+
+numbers.create_index("number", unique=True)
+user_numbers.create_index("number", unique=True)
 
 # ================= HELPERS =================
 def is_owner(uid):
@@ -77,7 +80,7 @@ def add_admin(m):
         return
     uid = int(m.text.split()[1])
     admins.update_one({"user_id": uid}, {"$set": {"user_id": uid}}, upsert=True)
-    bot.reply_to(m, "✅ Admin added")
+    bot.reply_to(m, "OK")
 
 @bot.message_handler(commands=["addchat"])
 def add_chat(m):
@@ -85,7 +88,7 @@ def add_chat(m):
         return
     cid = int(m.text.split()[1])
     chats.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
-    bot.reply_to(m, "✅ Group added")
+    bot.reply_to(m, "OK")
 
 # ================= UPLOAD NUMBERS =================
 @bot.message_handler(func=lambda m: m.text == "📤 Upload Numbers")
@@ -105,30 +108,27 @@ def upload_numbers_country(m):
 
 def save_numbers(m, country):
     added = 0
-    try:
-        if m.text:
-            nums = [n.strip() for n in m.text.replace("\n", ",").split(",") if n.strip()]
-        elif m.document:
-            f = bot.get_file(m.document.file_id)
-            content = bot.download_file(f.file_path).decode("utf-8", "ignore")
-            nums = [n.strip() for n in content.replace("\n", ",").split(",") if n.strip()]
-        else:
-            bot.reply_to(m, "❌ Invalid input")
-            return
+    if m.text:
+        nums = [n.strip() for n in m.text.replace("\n", ",").split(",") if n.strip()]
+    elif m.document:
+        f = bot.get_file(m.document.file_id)
+        content = bot.download_file(f.file_path).decode("utf-8", "ignore")
+        nums = [n.strip() for n in content.replace("\n", ",").split(",") if n.strip()]
+    else:
+        return
 
-        for n in nums:
-            if not numbers.find_one({"number": n}):
-                numbers.insert_one({
-                    "country": country,
-                    "number": n,
-                    "added_at": datetime.utcnow()
-                })
-                added += 1
+    for n in nums:
+        try:
+            numbers.insert_one({
+                "country": country,
+                "number": n,
+                "added_at": datetime.utcnow()
+            })
+            added += 1
+        except:
+            pass
 
-        bot.send_message(m.chat.id, f"✅ Added {added} numbers for {country}")
-
-    except Exception as e:
-        bot.send_message(m.chat.id, f"⚠️ Error: {e}")
+    bot.send_message(m.chat.id, f"Added {added} numbers for {country}")
 
 # ================= DELETE COUNTRY =================
 @bot.message_handler(func=lambda m: m.text == "🗑 Delete Country")
@@ -137,7 +137,7 @@ def delete_country(m):
         return
     bot.send_message(
         m.chat.id,
-        "🗑 Select country to delete:",
+        "Select country:",
         reply_markup=country_delete_keyboard()
     )
 
@@ -145,36 +145,65 @@ def delete_country(m):
 def confirm_delete_country(c):
     country = c.data.split("|")[1]
     numbers.delete_many({"country": country})
+    user_numbers.delete_many({"country": country})
     bot.edit_message_text(
-        f"🗑 All numbers deleted for {country}",
+        f"Deleted {country}",
         c.message.chat.id,
         c.message.message_id
     )
+
+# ================= PANEL STATUS =================
+@bot.message_handler(func=lambda m: m.text == "📊 Panel Status")
+def panel_status(m):
+    if not is_admin(m.from_user.id):
+        return
+
+    text = "📊 PANEL STATUS\n\n"
+    total_available = 0
+    total_used = 0
+
+    countries = set(numbers.distinct("country")) | set(user_numbers.distinct("country"))
+    for c in sorted(countries):
+        available = numbers.count_documents({"country": c})
+        used = user_numbers.count_documents({"country": c})
+        total_available += available
+        total_used += used
+        text += f"{c}\nAvailable: {available}\nUsed: {used}\n\n"
+
+    text += f"TOTAL AVAILABLE: {total_available}\nTOTAL USED: {total_used}"
+    bot.send_message(m.chat.id, text)
 
 # ================= USER =================
 @bot.message_handler(func=lambda m: m.text == "📞 Get Number")
 def get_number(m):
     if numbers.count_documents({}) == 0:
-        bot.reply_to(m, "❌ No numbers available")
+        bot.reply_to(m, "No numbers available")
         return
-    bot.send_message(m.chat.id, "🌍 Select country:", reply_markup=country_keyboard())
+    bot.send_message(
+        m.chat.id,
+        "Select country:",
+        reply_markup=country_keyboard()
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("country|"))
 def give_number(c):
     country = c.data.split("|")[1]
     doc = numbers.find_one_and_delete({"country": country})
     if not doc:
-        bot.answer_callback_query(c.id, "No numbers left")
         return
 
     user_numbers.update_one(
         {"number": doc["number"]},
-        {"$set": {"user_id": c.from_user.id}},
+        {"$set": {
+            "user_id": c.from_user.id,
+            "country": country,
+            "assigned_at": datetime.utcnow()
+        }},
         upsert=True
     )
 
     bot.edit_message_text(
-        f"📞 Your Number:\n<code>{html.escape(doc['number'])}</code>\n\n⌛ Waiting for OTP…",
+        f"<code>{html.escape(doc['number'])}</code>\nWaiting for OTP…",
         c.message.chat.id,
         c.message.message_id,
         parse_mode="HTML"
@@ -185,24 +214,22 @@ def format_user_otp(o):
     return (
         "📩 *LIVE OTP RECEIVED*\n\n"
         f"📞 *Number:* `{o['number']}`\n"
-        f"🔢 *OTP:* 🔥 `{o['otp']}` 🔥\n"
+        f"🔢 *OTP:* `{o['otp']}`\n"
         f"🏷 *Service:* {o['service']}\n"
         f"🌍 *Country:* {o['country']}\n"
         f"🕒 *Time:* {o['date']}\n\n"
-        f"💬 *SMS:*\n{o['message']}\n\n"
-        "⚡ *CYBER CORE OTP*"
+        f"💬 *SMS:*\n{o['message']}"
     )
 
 def format_group_otp(o):
     return (
         "📩 *LIVE OTP RECEIVED*\n\n"
         f"📞 *Number:* `{mask_number(o['number'])}`\n"
-        f"🔢 *OTP:* 🔥 `{o['otp']}` 🔥\n"
+        f"🔢 *OTP:* `{o['otp']}`\n"
         f"🏷 *Service:* {o['service']}\n"
         f"🌍 *Country:* {o['country']}\n"
         f"🕒 *Time:* {o['date']}\n\n"
-        f"💬 *SMS:*\n{o['message']}\n\n"
-        "⚡ *CYBER CORE OTP*"
+        f"💬 *SMS:*\n{o['message']}"
     )
 
 def send(chat_id, text):
@@ -215,8 +242,8 @@ def send(chat_id, text):
             "disable_web_page_preview": True,
             "reply_markup": {
                 "inline_keyboard": [[
-                    {"text": "🆘 Support", "url": SUPPORT_URL},
-                    {"text": "📲 Numbers", "url": NUMBERS_URL}
+                    {"text": "Support", "url": SUPPORT_URL},
+                    {"text": "Numbers", "url": NUMBERS_URL}
                 ]]
             }
         },
