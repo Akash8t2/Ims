@@ -25,14 +25,16 @@ time.sleep(1)
 mongo = MongoClient(MONGO_DB_URI)
 db = mongo[DB_NAME]
 
-numbers = db.numbers          # {country, number, added_at}
-user_numbers = db.user_numbers # {number, user_id, country}
-otps = db.otps               # {number, otp, service, country, date, message, sent}
-admins = db.admins           # {user_id}
-chats = db.chats             # {chat_id}
+numbers = db.numbers
+user_numbers = db.user_numbers
+otps = db.otps
+admins = db.admins
+chats = db.chats
 
 numbers.create_index("number", unique=True)
 user_numbers.create_index("number", unique=True)
+admins.create_index("user_id", unique=True)
+chats.create_index("chat_id", unique=True)
 
 # ================= HELPERS =================
 def is_owner(uid):
@@ -48,7 +50,8 @@ def main_keyboard(uid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin(uid):
         kb.add("📤 Upload Numbers", "🗑 Delete Country")
-        kb.add("📊 Panel Status")
+        kb.add("📊 Panel Status", "📊 Chats Status")
+        kb.add("📊 Admin Status", "📊 Users Status")
     kb.add("📞 Get Number")
     return kb
 
@@ -69,7 +72,7 @@ def country_delete_keyboard():
 def start(m):
     bot.send_message(
         m.chat.id,
-        "【 ILY OTP BOT 】\n\nSelect option 👇",
+        "【 ILY OTP BOT 】",
         reply_markup=main_keyboard(m.from_user.id)
     )
 
@@ -77,32 +80,64 @@ def start(m):
 @bot.message_handler(commands=["addadmin"])
 def add_admin(m):
     if not is_owner(m.from_user.id):
+        bot.reply_to(m, "Not allowed")
         return
     uid = int(m.text.split()[1])
     admins.update_one({"user_id": uid}, {"$set": {"user_id": uid}}, upsert=True)
-    bot.reply_to(m, "OK")
+    bot.reply_to(m, f"Admin added: {uid}")
 
 @bot.message_handler(commands=["addchat"])
 def add_chat(m):
     if not is_admin(m.from_user.id):
+        bot.reply_to(m, "Not allowed")
         return
     cid = int(m.text.split()[1])
     chats.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
-    bot.reply_to(m, "OK")
+    bot.reply_to(m, f"Chat added: {cid}")
+
+# ================= STATUS =================
+@bot.message_handler(func=lambda m: m.text == "📊 Chats Status")
+def chats_status(m):
+    if not is_admin(m.from_user.id):
+        return
+    count = chats.count_documents({})
+    text = f"Chats Count: {count}\n\n"
+    for c in chats.find():
+        text += f"{c['chat_id']}\n"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Admin Status")
+def admin_status(m):
+    if not is_admin(m.from_user.id):
+        return
+    text = f"Owner: {OWNER_ID}\n\nAdmins:\n"
+    for a in admins.find():
+        text += f"{a['user_id']}\n"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Users Status")
+def users_status(m):
+    if not is_admin(m.from_user.id):
+        return
+    total = user_numbers.count_documents({})
+    text = f"Total Users With Numbers: {total}\n\n"
+    for u in user_numbers.find():
+        text += f"User: {u['user_id']} | {u['number']} ({u['country']})\n"
+    bot.send_message(m.chat.id, text)
 
 # ================= UPLOAD NUMBERS =================
 @bot.message_handler(func=lambda m: m.text == "📤 Upload Numbers")
 def upload_numbers_start(m):
     if not is_admin(m.from_user.id):
         return
-    msg = bot.send_message(m.chat.id, "🌍 Enter COUNTRY NAME:")
+    msg = bot.send_message(m.chat.id, "Enter COUNTRY NAME:")
     bot.register_next_step_handler(msg, upload_numbers_country)
 
 def upload_numbers_country(m):
     country = m.text.strip().upper()
     msg = bot.send_message(
         m.chat.id,
-        f"✅ Country set: {country}\n\nSend numbers or upload .txt file"
+        f"Country set: {country}\nSend numbers or upload .txt"
     )
     bot.register_next_step_handler(msg, lambda x: save_numbers(x, country))
 
@@ -128,7 +163,7 @@ def save_numbers(m, country):
         except:
             pass
 
-    bot.send_message(m.chat.id, f"Added {added} numbers for {country}")
+    bot.send_message(m.chat.id, f"Numbers added: {added}")
 
 # ================= DELETE COUNTRY =================
 @bot.message_handler(func=lambda m: m.text == "🗑 Delete Country")
@@ -147,7 +182,7 @@ def confirm_delete_country(c):
     numbers.delete_many({"country": country})
     user_numbers.delete_many({"country": country})
     bot.edit_message_text(
-        f"Deleted {country}",
+        f"Country deleted: {country}",
         c.message.chat.id,
         c.message.message_id
     )
@@ -158,7 +193,7 @@ def panel_status(m):
     if not is_admin(m.from_user.id):
         return
 
-    text = "📊 PANEL STATUS\n\n"
+    text = "PANEL STATUS\n\n"
     total_available = 0
     total_used = 0
 
