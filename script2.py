@@ -15,7 +15,6 @@ MONGO_DB_URI = os.getenv("MONGO_DB_URI")
 
 SUPPORT_URL = "https://t.me/botcasx"
 NUMBERS_URL = "https://t.me/CyberOTPCore"
-
 DB_NAME = "otp_bot"
 
 # ================= INIT =================
@@ -26,8 +25,8 @@ time.sleep(1)
 mongo = MongoClient(MONGO_DB_URI)
 db = mongo[DB_NAME]
 
-numbers = db.numbers          # {country, number}
-user_numbers = db.user_numbers # {number, user_id}
+numbers = db.numbers
+user_numbers = db.user_numbers
 otps = db.otps
 admins = db.admins
 chats = db.chats
@@ -45,7 +44,8 @@ def mask_number(num):
 def main_keyboard(uid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin(uid):
-        kb.add("📤 Upload Numbers", "📊 Panel Status")
+        kb.add("📤 Upload Numbers", "🗑 Delete Country")
+        kb.add("📊 Panel Status")
     kb.add("📞 Get Number")
     return kb
 
@@ -53,6 +53,12 @@ def country_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=2)
     for c in numbers.distinct("country"):
         kb.add(types.InlineKeyboardButton(c, callback_data=f"country|{c}"))
+    return kb
+
+def country_delete_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for c in numbers.distinct("country"):
+        kb.add(types.InlineKeyboardButton(c, callback_data=f"delcountry|{c}"))
     return kb
 
 # ================= START =================
@@ -81,17 +87,77 @@ def add_chat(m):
     chats.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
     bot.reply_to(m, "✅ Group added")
 
+# ================= UPLOAD NUMBERS =================
+@bot.message_handler(func=lambda m: m.text == "📤 Upload Numbers")
+def upload_numbers_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    msg = bot.send_message(m.chat.id, "🌍 Enter COUNTRY NAME:")
+    bot.register_next_step_handler(msg, upload_numbers_country)
+
+def upload_numbers_country(m):
+    country = m.text.strip().upper()
+    msg = bot.send_message(
+        m.chat.id,
+        f"✅ Country set: {country}\n\nSend numbers or upload .txt file"
+    )
+    bot.register_next_step_handler(msg, lambda x: save_numbers(x, country))
+
+def save_numbers(m, country):
+    added = 0
+    try:
+        if m.text:
+            nums = [n.strip() for n in m.text.replace("\n", ",").split(",") if n.strip()]
+        elif m.document:
+            f = bot.get_file(m.document.file_id)
+            content = bot.download_file(f.file_path).decode("utf-8", "ignore")
+            nums = [n.strip() for n in content.replace("\n", ",").split(",") if n.strip()]
+        else:
+            bot.reply_to(m, "❌ Invalid input")
+            return
+
+        for n in nums:
+            if not numbers.find_one({"number": n}):
+                numbers.insert_one({
+                    "country": country,
+                    "number": n,
+                    "added_at": datetime.utcnow()
+                })
+                added += 1
+
+        bot.send_message(m.chat.id, f"✅ Added {added} numbers for {country}")
+
+    except Exception as e:
+        bot.send_message(m.chat.id, f"⚠️ Error: {e}")
+
+# ================= DELETE COUNTRY =================
+@bot.message_handler(func=lambda m: m.text == "🗑 Delete Country")
+def delete_country(m):
+    if not is_admin(m.from_user.id):
+        return
+    bot.send_message(
+        m.chat.id,
+        "🗑 Select country to delete:",
+        reply_markup=country_delete_keyboard()
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("delcountry|"))
+def confirm_delete_country(c):
+    country = c.data.split("|")[1]
+    numbers.delete_many({"country": country})
+    bot.edit_message_text(
+        f"🗑 All numbers deleted for {country}",
+        c.message.chat.id,
+        c.message.message_id
+    )
+
 # ================= USER =================
 @bot.message_handler(func=lambda m: m.text == "📞 Get Number")
 def get_number(m):
     if numbers.count_documents({}) == 0:
         bot.reply_to(m, "❌ No numbers available")
         return
-    bot.send_message(
-        m.chat.id,
-        "🌍 Select country:",
-        reply_markup=country_keyboard()
-    )
+    bot.send_message(m.chat.id, "🌍 Select country:", reply_markup=country_keyboard())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("country|"))
 def give_number(c):
@@ -140,23 +206,24 @@ def format_group_otp(o):
     )
 
 def send(chat_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [
-                [
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+            "reply_markup": {
+                "inline_keyboard": [[
                     {"text": "🆘 Support", "url": SUPPORT_URL},
                     {"text": "📲 Numbers", "url": NUMBERS_URL}
-                ]
-            ]
-        }
-    }, timeout=15)
+                ]]
+            }
+        },
+        timeout=15
+    )
 
-# ================= OTP DISPATCHER =================
+# ================= OTP WORKER =================
 def otp_worker():
     while True:
         otp = otps.find_one({"sent": False})
