@@ -1,36 +1,45 @@
 {
   "name": "OTP Telegram Bot",
-  "description": "Telegram OTP bot with MongoDB, admin system, number upload via TXT, and live OTP forwarding to user and groups.",
-  "repository": "https://github.com/yourusername/otp-telegram-bot",
+  "description": "Telegram OTP system with MongoDB, user-number mapping, masked group OTPs",
   "keywords": [
     "telegram",
     "otp",
-    "bot",
     "mongodb",
-    "heroku"
+    "heroku",
+    "bot"
   ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
   "env": {
     "BOT_TOKEN": {
       "description": "Telegram Bot Token",
       "required": true
     },
     "OWNER_ID": {
-      "description": "Telegram User ID of Bot Owner",
+      "description": "Telegram User ID of bot owner",
       "required": true
     },
     "MONGO_DB_URI": {
-      "description": "MongoDB Atlas SRV Connection String",
+      "description": "MongoDB connection string (non-SRV recommended on Heroku free)",
+      "required": true
+    },
+    "AJAX_URL": {
+      "description": "INTS panel AJAX URL",
+      "value": "http://144.217.66.209/ints/agent/res/data_smscdr.php",
       "required": true
     },
     "PHPSESSID": {
       "description": "PHPSESSID cookie for INTS panel",
       "required": true
-    }
-  },
-  "formation": {
-    "worker": {
-      "quantity": 1,
-      "size": "Basic"
+    },
+    "CHECK_INTERVAL": {
+      "description": "OTP fetch interval in seconds",
+      "value": "10",
+      "required": false
     }
   },
   "buildpacks": [
