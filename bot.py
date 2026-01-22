@@ -1,403 +1,241 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-IMS SMS Forwarder - COMPLETE WORKING VERSION
-Forwards OTP messages from IMS SMS to Telegram
-"""
-
 import os
 import time
-import json
-import logging
+import html
+import threading
 import re
-from hashlib import sha1
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
-
 import requests
+from datetime import datetime
+from telebot import TeleBot, types
+from pymongo import MongoClient
 
-# --- config ---
-BASE_URL = os.getenv("BASE_URL", "https://imssms.org").rstrip("/")
-DATA_API_PATH = os.getenv("IMSSMS_DATA_API_PATH", "/client/res/data_smscdr.php")
-DATA_URL = urljoin(BASE_URL, DATA_API_PATH)
+# ================= CONFIG =================
 
-BOT_TOKEN = os.getenv("IMSSMS_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-CHAT_IDS_RAW = os.getenv("IMSSMS_CHAT_IDS") or os.getenv("CHAT_ID") or os.getenv("CHAT_IDS", "")
-CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
+BOT_TOKEN = "7448362382:AAGzYcF4XH5cAOIOsrvJ6E9MXqjnmOdKs2o"
+OWNER_ID = 5397621246          # only owner can add admins
+MONGO_DB_URI = "mongodb+srv://akkingisin2026_db_user:JGPAXJSayxR9yFen@cluster0.hrbb5tc.mongodb.net/?appName=Cluster0"
+DB_NAME = "otp_bot"
 
-# Manual session cookie - GET THIS FROM YOUR BROWSER
-MANUAL_SESSION = os.getenv("MANUAL_SESSION") or os.getenv("PHPSESSID")
+AJAX_URL = "http://144.217.66.209/ints/agent/res/data_smscdr.php"
+CHECK_INTERVAL = 10
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
+COOKIES = {
+    "PHPSESSID": "9e49b48530129a97ed51bacb04d4575f"
+}
 
-# --- logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger("imssms-bot")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01"
+}
 
-# --- session ---
+GROUP_LINK = "https://t.me/OtpRush"
+CHANNEL_LINK = "https://t.me/mailtwist"
+
+# ================= INIT =================
+
+bot = TeleBot(BOT_TOKEN)
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-})
+session.headers.update(HEADERS)
+session.cookies.update(COOKIES)
 
-# Set manual session cookie if provided
-if MANUAL_SESSION:
-    session.cookies.set("PHPSESSID", MANUAL_SESSION)
-    log.info("Using manual session cookie: %s...", MANUAL_SESSION[:20])
+mongo = MongoClient(MONGO_DB_URI)
+db = mongo[DB_NAME]
 
-# OTP regex patterns (ordered by priority)
-OTP_PATTERNS = [
-    r'\b\d{3}-\d{3}\b',      # 295-055 (most common)
-    r'\b\d{6}\b',            # 295055
-    r'\b\d{3}\s\d{3}\b',     # 295 055
-    r'\b\d{3,8}\b',          # fallback: any 3-8 digit number
-]
+admins_col = db.admins
+chats_col = db.chats
+numbers_col = db.numbers
+owners_col = db.number_owner
+state_col = db.state
 
-# In-memory seen storage (Heroku has ephemeral filesystem)
-seen_messages = set()
+# ================= HELPERS =================
 
-# --- Telegram send ---
-def send_telegram(msg: str):
-    """Send message to Telegram"""
-    if not BOT_TOKEN or not CHAT_IDS:
-        log.warning("Telegram token or chat ids missing; skipping send")
-        return False
-    
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    success = True
-    
-    for cid in CHAT_IDS:
-        try:
-            resp = requests.post(
-                url, 
-                data={
-                    "chat_id": cid, 
-                    "text": msg, 
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True
-                }, 
-                timeout=10
-            )
-            if resp.status_code != 200:
-                log.warning("Telegram send failure %s: %s", resp.status_code, resp.text[:200])
-                success = False
-            else:
-                log.debug("✅ Telegram message sent to chat %s", cid)
-        except Exception as e:
-            log.warning("Telegram send exception: %s", e)
-            success = False
-    
-    return success
+def is_owner(uid):
+    return uid == OWNER_ID
 
-# --- Extract OTP from message ---
-def extract_otp(message: str) -> str:
-    """Extract OTP code from message using multiple patterns"""
-    if not message:
-        return "N/A"
-    
-    for pattern in OTP_PATTERNS:
-        matches = re.findall(pattern, message)
-        if matches:
-            # Return the last match (most likely the OTP)
-            return matches[-1]
-    
-    return "N/A"
+def is_admin(uid):
+    return admins_col.find_one({"user_id": uid}) is not None or is_owner(uid)
 
-# --- Fetch SMS with comprehensive data detection ---
-def fetch_sms(minutes_back=60):
-    """Fetch SMS data from IMS SMS API"""
-    try:
-        now = datetime.now(timezone.utc)
-        f1 = (now - timedelta(minutes=minutes_back)).strftime("%Y-%m-%d %H:%M:%S")
-        f2 = now.strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Exact parameters from successful API call
-        params = {
-            "fdate1": f1,
-            "fdate2": f2,
-            "frange": "",
-            "fnum": "",
-            "fcli": "",
-            "fgdate": "",
-            "fgmonth": "",
-            "fgrange": "",
-            "fgnumber": "",
-            "fgcli": "",
-            "fg": "0",
-            "sEcho": "1",
-            "iColumns": "7",
-            "sColumns": ",,,,,,",
-            "iDisplayStart": "0",
-            "iDisplayLength": "25",
-            "mDataProp_0": "0",
-            "sSearch_0": "",
-            "bRegex_0": "false",
-            "bSearchable_0": "true",
-            "bSortable_0": "true",
-            "mDataProp_1": "1",
-            "sSearch_1": "",
-            "bRegex_1": "false",
-            "bSearchable_1": "true",
-            "bSortable_1": "true",
-            "mDataProp_2": "2",
-            "sSearch_2": "",
-            "bRegex_2": "false",
-            "bSearchable_2": "true",
-            "bSortable_2": "true",
-            "mDataProp_3": "3",
-            "sSearch_3": "",
-            "bRegex_3": "false",
-            "bSearchable_3": "true",
-            "bSortable_3": "true",
-            "mDataProp_4": "4",
-            "sSearch_4": "",
-            "bRegex_4": "false",
-            "bSearchable_4": "true",
-            "bSortable_4": "true",
-            "mDataProp_5": "5",
-            "sSearch_5": "",
-            "bRegex_5": "false",
-            "bSearchable_5": "true",
-            "bSortable_5": "true",
-            "mDataProp_6": "6",
-            "sSearch_6": "",
-            "bRegex_6": "false",
-            "bSearchable_6": "true",
-            "bSortable_6": "true",
-            "sSearch": "",
-            "bRegex": "false",
-            "iSortCol_0": "0",
-            "sSortDir_0": "desc",
-            "iSortingCols": "1",
-            "_": str(int(time.time() * 1000)),
-        }
-        
-        headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{BASE_URL}/client/SMSDashboard",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-        }
+def extract_otp(text):
+    m = re.search(r"\b(\d{4,8})\b", text or "")
+    return m.group(1) if m else "N/A"
 
-        log.info("📡 Fetching SMS data from last %d minutes", minutes_back)
-        r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
-        
-        log.info("📊 API Response: %d %s", r.status_code, r.reason)
-        
-        if r.status_code != 200:
-            log.warning("❌ Fetch failed with status: %d", r.status_code)
-            return "SESSION_EXPIRED"
-            
-        # Parse JSON response
-        try:
-            data = r.json()
-            if isinstance(data, dict) and "aaData" in data:
-                raw_rows = len(data["aaData"])
-                log.info("📦 Received %d raw data rows", raw_rows)
-                
-                # Filter valid SMS rows
-                valid_sms = []
-                for i, row in enumerate(data["aaData"]):
-                    if isinstance(row, list) and len(row) >= 5:
-                        timestamp = str(row[0]) if len(row) > 0 else ""
-                        number = str(row[2]) if len(row) > 2 else ""
-                        message = str(row[4]) if len(row) > 4 else ""
-                        
-                        # Skip footer rows and invalid data
-                        if (number and not number.startswith("0,0,0") and 
-                            message and len(number) >= 3):
-                            valid_sms.append(row)
-                        else:
-                            log.debug("Skipping invalid row %d: %s", i, row[:3])
-                    else:
-                        log.debug("Skipping malformed row %d: %s", i, row)
-                
-                log.info("✅ Found %d valid SMS records", len(valid_sms))
-                
-                # Log sample for debugging
-                if valid_sms:
-                    sample = valid_sms[0]
-                    log.info("📝 Sample: %s | %s | %s", 
-                            sample[0] if len(sample) > 0 else "N/A",
-                            sample[2] if len(sample) > 2 else "N/A", 
-                            (sample[4][:80] + "...") if len(sample) > 4 and len(sample[4]) > 80 else 
-                            sample[4] if len(sample) > 4 else "N/A")
-                
-                return valid_sms
-            else:
-                log.warning("Unexpected JSON structure in response")
-                return []
-                
-        except json.JSONDecodeError as e:
-            log.error("❌ JSON parse failed: %s", e)
-            # Check if we got HTML instead (session expired)
-            if r.text.strip().startswith(('<!DOCTYPE html>', '<html')):
-                log.error("🔐 Session expired - got HTML login page")
-                return "SESSION_EXPIRED"
-            log.debug("Raw response: %s", r.text[:500])
-            return []
-            
-    except requests.exceptions.RequestException as e:
-        log.error("🌐 Network error: %s", e)
-        return "NETWORK_ERROR"
-    except Exception as e:
-        log.exception("💥 Unexpected error in fetch_sms: %s", e)
-        return "ERROR"
+def mask_number(num):
+    if len(num) < 6:
+        return num
+    return num[:3] + "******" + num[-2:]
 
-# --- Process and forward SMS ---
-def process_sms(row):
-    """Process a single SMS row and forward to Telegram"""
-    try:
-        # Extract data from row
-        ts = str(row[0]) if len(row) > 0 else "Unknown"
-        operator = str(row[1]) if len(row) > 1 else "Unknown"
-        number = str(row[2]) if len(row) > 2 else "Unknown"
-        service = str(row[3]) if len(row) > 3 else "Unknown"
-        message = str(row[4]) if len(row) > 4 else ""
-        
-        # Validate essential fields
-        if not number or number.startswith("0,0,0") or not message:
-            log.debug("Skipping invalid SMS row")
-            return False
-            
-    except Exception as e:
-        log.warning("Failed to parse SMS row: %s - %s", row, e)
-        return False
+def build_payload():
+    today = datetime.now().strftime("%Y-%m-%d")
+    return {
+        "fdate1": f"{today} 00:00:00",
+        "fdate2": f"{today} 23:59:59",
+        "iDisplayStart": 0,
+        "iDisplayLength": 25
+    }
 
-    # Create unique message ID for deduplication
-    message_id = sha1(f"{ts}|{number}|{message}".encode()).hexdigest()
-    
-    # Check for duplicates
-    if message_id in seen_messages:
-        log.debug("Skipping duplicate message from %s", number)
-        return False
-        
-    # Extract OTP code
-    otp_code = extract_otp(message)
-    
-    # Format Telegram message
-    telegram_msg = (
-        f"✅ *New OTP Received* ✅\n\n"
-        f"🕰 *Time:* `{ts}`\n"
-        f"📞 *Number:* `{number}`\n"
-        f"🔢 *OTP Code:* `{otp_code}`\n"
-        f"🌍 *Operator:* {operator}\n"
-        f"📱 *Service:* {service}\n\n"
-        f"💬 *Message:*\n`{message}`\n\n"
-        f"🔗 *Source:* {BASE_URL}"
+# ================= KEYBOARDS =================
+
+def main_keyboard(uid):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if is_admin(uid):
+        kb.add("📤 Upload Numbers", "📊 Panel Status")
+    kb.add("📞 Get Number")
+    return kb
+
+def country_inline():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for c in numbers_col.distinct("country"):
+        kb.add(types.InlineKeyboardButton(c, callback_data=f"country|{c}"))
+    return kb
+
+# ================= START =================
+
+@bot.message_handler(commands=["start"])
+def start(m):
+    bot.send_message(
+        m.chat.id,
+        "【 ILY OTP BOT 】",
+        reply_markup=main_keyboard(m.from_user.id)
     )
-    
-    # Send to Telegram
-    if send_telegram(telegram_msg):
-        seen_messages.add(message_id)
-        log.info("📤 Forwarded OTP from %s: %s", number, otp_code)
-        return True
-    else:
-        log.error("❌ Failed to send Telegram message for %s", number)
-        return False
 
-# --- Health check and session validation ---
-def check_session_health():
-    """Check if the current session is still valid"""
+# ================= ADMIN COMMANDS =================
+
+@bot.message_handler(commands=["addadmin"])
+def add_admin(m):
+    if not is_owner(m.from_user.id):
+        return
     try:
-        test_params = {
-            "fdate1": "2025-01-01 00:00:00",
-            "fdate2": "2025-01-01 00:01:00",
-            "sEcho": "1",
-            "iDisplayStart": "0",
-            "iDisplayLength": "1",
-            "_": str(int(time.time() * 1000)),
-        }
-        
-        r = session.get(DATA_URL, params=test_params, timeout=10)
-        return r.status_code == 200 and "aaData" in r.json()
+        uid = int(m.text.split()[1])
+        admins_col.update_one({"user_id": uid}, {"$set": {"user_id": uid}}, upsert=True)
+        bot.reply_to(m, "Admin added")
     except:
-        return False
+        pass
 
-# --- Main loop ---
-def main_loop():
-    """Main application loop"""
-    # Validate configuration
-    if not BOT_TOKEN or not CHAT_IDS:
-        log.error("❌ Missing required configuration: BOT_TOKEN or CHAT_IDS")
+@bot.message_handler(commands=["addchat"])
+def add_chat(m):
+    if not is_admin(m.from_user.id):
         return
-        
-    if not MANUAL_SESSION:
-        log.error("❌ MANUAL_SESSION not configured")
-        log.error("💡 How to setup:")
-        log.error("1. Login to %s in your browser", BASE_URL)
-        log.error("2. Press F12 → Application → Cookies → Copy PHPSESSID value")
-        log.error("3. Run: heroku config:set MANUAL_SESSION=your_phpsessid_value")
+    try:
+        cid = int(m.text.split()[1])
+        chats_col.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
+        bot.reply_to(m, "Chat added")
+    except:
+        pass
+
+# ================= NUMBER SYSTEM =================
+
+@bot.message_handler(func=lambda m: m.text == "📞 Get Number")
+def get_number(m):
+    bot.send_message(m.chat.id, "Select country:", reply_markup=country_inline())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("country|"))
+def give_number(c):
+    country = c.data.split("|", 1)[1]
+    doc = numbers_col.find_one_and_delete({"country": country})
+    if not doc:
+        bot.answer_callback_query(c.id, "No numbers left")
         return
 
-    log.info("🚀 Starting IMS SMS Forwarder")
-    log.info("📞 Monitoring for OTP messages...")
-    log.info("⏰ Polling interval: %d seconds", POLL_INTERVAL)
-    log.info("👥 Telegram chats: %s", CHAT_IDS)
-    
-    # Initial session health check
-    if not check_session_health():
-        log.warning("⚠️ Initial session health check failed - proceeding anyway")
-    
-    consecutive_failures = 0
-    max_consecutive_failures = 5
-    
+    num = doc["number"]
+    owners_col.update_one(
+        {"number": num},
+        {"$set": {"number": num, "user_id": c.from_user.id}},
+        upsert=True
+    )
+
+    text = (
+        f"🌍 <b>{country}</b>\n\n"
+        f"<code>{html.escape(num)}</code>\n\n"
+        "⌛ Waiting for OTP..."
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💬 OTP GROUP", url=GROUP_LINK))
+
+    bot.edit_message_text(
+        text,
+        c.message.chat.id,
+        c.message.message_id,
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+# ================= UPLOAD NUMBERS =================
+
+@bot.message_handler(func=lambda m: m.text == "📤 Upload Numbers" and is_admin(m.from_user.id))
+def upload_numbers(m):
+    msg = bot.send_message(m.chat.id, "Send country name:")
+    bot.register_next_step_handler(msg, ask_numbers)
+
+def ask_numbers(m):
+    country = m.text.strip()
+    msg = bot.send_message(m.chat.id, "Send numbers (comma/newline):")
+    bot.register_next_step_handler(msg, lambda x: save_numbers(x, country))
+
+def save_numbers(m, country):
+    nums = [n.strip() for n in m.text.replace("\n", ",").split(",") if n.strip()]
+    for n in nums:
+        numbers_col.insert_one({"country": country, "number": n})
+    bot.send_message(m.chat.id, f"Added {len(nums)} numbers")
+
+# ================= OTP WORKER =================
+
+def otp_worker():
     while True:
         try:
-            # Fetch SMS data
-            result = fetch_sms(minutes_back=60)
-            
-            # Handle different result types
-            if result in ["SESSION_EXPIRED", "NETWORK_ERROR", "ERROR"]:
-                consecutive_failures += 1
-                log.error("❌ Operation failed: %s (%d/%d)", 
-                         result, consecutive_failures, max_consecutive_failures)
-                
-                if consecutive_failures >= max_consecutive_failures:
-                    if result == "SESSION_EXPIRED":
-                        log.error("🔐 Session expired. Please update MANUAL_SESSION:")
-                        log.error("1. Login to %s in browser", BASE_URL)
-                        log.error("2. Get new PHPSESSID from Developer Tools")
-                        log.error("3. Run: heroku config:set MANUAL_SESSION=new_value")
-                    time.sleep(300)  # Wait 5 minutes
-                    consecutive_failures = 0
-                else:
-                    time.sleep(60)  # Wait 1 minute
+            r = session.get(AJAX_URL, params=build_payload(), timeout=20)
+            rows = r.json().get("aaData", [])
+            rows = [r for r in rows if r and isinstance(r[0], str)]
+            if not rows:
+                time.sleep(CHECK_INTERVAL)
                 continue
-                
-            # Reset failure counter on success
-            consecutive_failures = 0
-            
-            # Process SMS records
-            if result and isinstance(result, list):
-                processed_count = 0
-                for sms_row in result:
-                    if process_sms(sms_row):
-                        processed_count += 1
-                
-                if processed_count > 0:
-                    log.info("📨 Successfully processed %d new OTP messages", processed_count)
-                else:
-                    log.info("⏳ No new OTP messages found in this check")
-            else:
-                log.info("⏳ No SMS data to process")
-            
-            # Wait for next poll
-            time.sleep(POLL_INTERVAL)
-                
-        except KeyboardInterrupt:
-            log.info("⏹️ Application stopped by user")
-            break
-        except Exception as e:
-            log.exception("💥 Unexpected error in main loop: %s", e)
-            log.info("🔄 Restarting in 30 seconds...")
-            time.sleep(30)
 
-if __name__ == "__main__":
-    main_loop()
+            rows.sort(key=lambda x: datetime.strptime(x[0], "%Y-%m-%d %H:%M:%S"), reverse=True)
+            row = rows[0]
+            uid = row[0] + row[2] + (row[5] or "")
+
+            state = state_col.find_one({"_id": "state"})
+            if state and state.get("last_uid") == uid:
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            state_col.update_one(
+                {"_id": "state"},
+                {"$set": {"last_uid": uid}},
+                upsert=True
+            )
+
+            number = row[2]
+            if not number.startswith("+"):
+                number = "+" + number
+
+            otp = extract_otp(row[5])
+
+            msg_user = (
+                "📩 LIVE OTP\n\n"
+                f"📞 `{number}`\n"
+                f"🔢 `{otp}`"
+            )
+
+            msg_group = (
+                "📩 LIVE OTP\n\n"
+                f"📞 `{mask_number(number)}`\n"
+                f"🔢 `{otp}`"
+            )
+
+            for chat in chats_col.find():
+                bot.send_message(chat["chat_id"], msg_group, parse_mode="Markdown")
+
+            owner = owners_col.find_one({"number": number})
+            if owner:
+                bot.send_message(owner["user_id"], msg_user, parse_mode="Markdown")
+
+        except:
+            pass
+
+        time.sleep(CHECK_INTERVAL)
+
+# ================= MAIN =================
+
+threading.Thread(target=otp_worker, daemon=True).start()
+bot.infinity_polling()
