@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os
 import time
+import re
+import json
 import html
 import threading
-import re
+import logging
 import requests
 from datetime import datetime
 from telebot import TeleBot, types
@@ -11,16 +13,17 @@ from pymongo import MongoClient
 
 # ================= CONFIG =================
 
-BOT_TOKEN = "7448362382:AAHz97Vtg1OOSImSHl0wvTNNDqCh_0HCX5A"
-OWNER_ID = 5397621246          # only owner can add admins
-MONGO_DB_URI = "mongodb+srv://akkingisin2026_db_user:JGPAXJSayxR9yFen@cluster0.hrbb5tc.mongodb.net/?appName=Cluster0"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+
+MONGO_DB_URI = os.getenv("MONGO_DB_URI")
 DB_NAME = "otp_bot"
 
 AJAX_URL = "http://144.217.66.209/ints/agent/res/data_smscdr.php"
 CHECK_INTERVAL = 10
 
 COOKIES = {
-    "PHPSESSID": "9e49b48530129a97ed51bacb04d4575f"
+    "PHPSESSID": os.getenv("PHPSESSID", "")
 }
 
 HEADERS = {
@@ -30,7 +33,6 @@ HEADERS = {
 }
 
 GROUP_LINK = "https://t.me/OtpRush"
-CHANNEL_LINK = "https://t.me/mailtwist"
 
 # ================= INIT =================
 
@@ -39,14 +41,16 @@ session = requests.Session()
 session.headers.update(HEADERS)
 session.cookies.update(COOKIES)
 
-mongo = MongoClient(MONGO_DB_URI)
+mongo = MongoClient(MONGO_DB_URI, serverSelectionTimeoutMS=5000)
 db = mongo[DB_NAME]
 
-admins_col = db.admins
-chats_col = db.chats
-numbers_col = db.numbers
-owners_col = db.number_owner
-state_col = db.state
+admins = db.admins
+chats = db.chats
+numbers = db.numbers
+owners = db.number_owner
+state = db.state
+
+logging.basicConfig(level=logging.INFO)
 
 # ================= HELPERS =================
 
@@ -54,16 +58,14 @@ def is_owner(uid):
     return uid == OWNER_ID
 
 def is_admin(uid):
-    return admins_col.find_one({"user_id": uid}) is not None or is_owner(uid)
+    return is_owner(uid) or admins.find_one({"user_id": uid})
 
 def extract_otp(text):
     m = re.search(r"\b(\d{4,8})\b", text or "")
     return m.group(1) if m else "N/A"
 
 def mask_number(num):
-    if len(num) < 6:
-        return num
-    return num[:3] + "******" + num[-2:]
+    return num[:3] + "******" + num[-2:] if len(num) > 6 else num
 
 def build_payload():
     today = datetime.now().strftime("%Y-%m-%d")
@@ -74,32 +76,25 @@ def build_payload():
         "iDisplayLength": 25
     }
 
-# ================= KEYBOARDS =================
-
-def main_keyboard(uid):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    if is_admin(uid):
-        kb.add("📤 Upload Numbers", "📊 Panel Status")
-    kb.add("📞 Get Number")
-    return kb
-
-def country_inline():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for c in numbers_col.distinct("country"):
-        kb.add(types.InlineKeyboardButton(c, callback_data=f"country|{c}"))
-    return kb
-
-# ================= START =================
+# ================= BOT COMMANDS =================
 
 @bot.message_handler(commands=["start"])
 def start(m):
     bot.send_message(
         m.chat.id,
-        "【 ILY OTP BOT 】",
+        "🔥 *OTP BOT READY*\n\nUse buttons below",
+        parse_mode="Markdown",
         reply_markup=main_keyboard(m.from_user.id)
     )
 
-# ================= ADMIN COMMANDS =================
+def main_keyboard(uid):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📞 Get Number")
+    if is_admin(uid):
+        kb.add("📤 Upload Numbers")
+    return kb
+
+# ---------- OWNER ONLY ----------
 
 @bot.message_handler(commands=["addadmin"])
 def add_admin(m):
@@ -107,10 +102,12 @@ def add_admin(m):
         return
     try:
         uid = int(m.text.split()[1])
-        admins_col.update_one({"user_id": uid}, {"$set": {"user_id": uid}}, upsert=True)
-        bot.reply_to(m, "Admin added")
+        admins.update_one({"user_id": uid}, {"$set": {"user_id": uid}}, upsert=True)
+        bot.reply_to(m, "✅ Admin added")
     except:
-        pass
+        bot.reply_to(m, "Usage: /addadmin user_id")
+
+# ---------- ADMIN ----------
 
 @bot.message_handler(commands=["addchat"])
 def add_chat(m):
@@ -118,65 +115,57 @@ def add_chat(m):
         return
     try:
         cid = int(m.text.split()[1])
-        chats_col.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
-        bot.reply_to(m, "Chat added")
+        chats.update_one({"chat_id": cid}, {"$set": {"chat_id": cid}}, upsert=True)
+        bot.reply_to(m, "✅ Chat added")
     except:
-        pass
+        bot.reply_to(m, "Usage: /addchat chat_id")
 
 # ================= NUMBER SYSTEM =================
 
 @bot.message_handler(func=lambda m: m.text == "📞 Get Number")
 def get_number(m):
-    bot.send_message(m.chat.id, "Select country:", reply_markup=country_inline())
+    countries = numbers.distinct("country")
+    kb = types.InlineKeyboardMarkup()
+    for c in countries:
+        kb.add(types.InlineKeyboardButton(c, callback_data=f"country|{c}"))
+    bot.send_message(m.chat.id, "Select country:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("country|"))
 def give_number(c):
     country = c.data.split("|", 1)[1]
-    doc = numbers_col.find_one_and_delete({"country": country})
+    doc = numbers.find_one_and_delete({"country": country})
     if not doc:
         bot.answer_callback_query(c.id, "No numbers left")
         return
 
     num = doc["number"]
-    owners_col.update_one(
+    owners.update_one(
         {"number": num},
         {"$set": {"number": num, "user_id": c.from_user.id}},
         upsert=True
     )
 
-    text = (
-        f"🌍 <b>{country}</b>\n\n"
-        f"<code>{html.escape(num)}</code>\n\n"
-        "⌛ Waiting for OTP..."
-    )
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("💬 OTP GROUP", url=GROUP_LINK))
-
     bot.edit_message_text(
-        text,
+        f"<b>{country}</b>\n\n<code>{html.escape(num)}</code>\n\n⌛ Waiting for OTP…",
         c.message.chat.id,
         c.message.message_id,
-        parse_mode="HTML",
-        reply_markup=kb
+        parse_mode="HTML"
     )
 
-# ================= UPLOAD NUMBERS =================
+# ---------- UPLOAD TXT ----------
 
-@bot.message_handler(func=lambda m: m.text == "📤 Upload Numbers" and is_admin(m.from_user.id))
-def upload_numbers(m):
-    msg = bot.send_message(m.chat.id, "Send country name:")
-    bot.register_next_step_handler(msg, ask_numbers)
-
-def ask_numbers(m):
-    country = m.text.strip()
-    msg = bot.send_message(m.chat.id, "Send numbers (comma/newline):")
-    bot.register_next_step_handler(msg, lambda x: save_numbers(x, country))
-
-def save_numbers(m, country):
-    nums = [n.strip() for n in m.text.replace("\n", ",").split(",") if n.strip()]
-    for n in nums:
-        numbers_col.insert_one({"country": country, "number": n})
-    bot.send_message(m.chat.id, f"Added {len(nums)} numbers")
+@bot.message_handler(content_types=["document"])
+def upload_txt(m):
+    if not is_admin(m.from_user.id):
+        return
+    file = bot.download_file(bot.get_file(m.document.file_id).file_path)
+    lines = file.decode(errors="ignore").splitlines()
+    count = 0
+    for line in lines:
+        if line.strip():
+            numbers.insert_one({"country": "AUTO", "number": line.strip()})
+            count += 1
+    bot.reply_to(m, f"✅ {count} numbers added")
 
 # ================= OTP WORKER =================
 
@@ -194,16 +183,12 @@ def otp_worker():
             row = rows[0]
             uid = row[0] + row[2] + (row[5] or "")
 
-            state = state_col.find_one({"_id": "state"})
-            if state and state.get("last_uid") == uid:
+            last = state.find_one({"_id": "state"})
+            if last and last.get("last_uid") == uid:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            state_col.update_one(
-                {"_id": "state"},
-                {"$set": {"last_uid": uid}},
-                upsert=True
-            )
+            state.update_one({"_id": "state"}, {"$set": {"last_uid": uid}}, upsert=True)
 
             number = row[2]
             if not number.startswith("+"):
@@ -211,31 +196,24 @@ def otp_worker():
 
             otp = extract_otp(row[5])
 
-            msg_user = (
-                "📩 LIVE OTP\n\n"
-                f"📞 `{number}`\n"
-                f"🔢 `{otp}`"
-            )
+            msg_user = f"📩 OTP\n\n📞 `{number}`\n🔢 `{otp}`"
+            msg_group = f"📩 OTP\n\n📞 `{mask_number(number)}`\n🔢 `{otp}`"
 
-            msg_group = (
-                "📩 LIVE OTP\n\n"
-                f"📞 `{mask_number(number)}`\n"
-                f"🔢 `{otp}`"
-            )
+            for c in chats.find():
+                bot.send_message(c["chat_id"], msg_group, parse_mode="Markdown")
 
-            for chat in chats_col.find():
-                bot.send_message(chat["chat_id"], msg_group, parse_mode="Markdown")
-
-            owner = owners_col.find_one({"number": number})
+            owner = owners.find_one({"number": number})
             if owner:
                 bot.send_message(owner["user_id"], msg_user, parse_mode="Markdown")
 
-        except:
-            pass
+        except Exception as e:
+            logging.error(e)
 
         time.sleep(CHECK_INTERVAL)
 
 # ================= MAIN =================
 
 threading.Thread(target=otp_worker, daemon=True).start()
+bot.remove_webhook()
+time.sleep(1)
 bot.infinity_polling()
