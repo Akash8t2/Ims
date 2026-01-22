@@ -11,7 +11,7 @@ from pymongo import MongoClient
 
 # ================= CONFIG =================
 
-BOT_TOKEN = "7448362382:AAGzYcF4XH5cAOIOsrvJ6E9MXqjnmOdKs2o"
+BOT_TOKEN = "7448362382:AAHz97Vtg1OOSImSHl0wvTNNDqCh_0HCX5A"
 OWNER_ID = 5397621246          # only owner can add admins
 MONGO_DB_URI = "mongodb+srv://akkingisin2026_db_user:JGPAXJSayxR9yFen@cluster0.hrbb5tc.mongodb.net/?appName=Cluster0"
 DB_NAME = "otp_bot"
