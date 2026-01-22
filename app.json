@@ -1,41 +1,30 @@
 {
-  "name": "OTP Sentinel",
-  "description": "🛡️ Your Guardian for Verification Codes - Forward OTP messages from IMS SMS to Telegram",
-  "repository": "https://github.com/your-username/otp-sentinel",
-  "logo": "https://raw.githubusercontent.com/your-username/otp-sentinel/main/assets/logo.png",
+  "name": "OTP Telegram Bot",
+  "description": "Telegram OTP bot with MongoDB, admin system, number upload via TXT, and live OTP forwarding to user and groups.",
+  "repository": "https://github.com/yourusername/otp-telegram-bot",
   "keywords": [
-    "python",
     "telegram",
-    "bot",
     "otp",
-    "sms",
-    "verification",
-    "security",
-    "automation"
+    "bot",
+    "mongodb",
+    "heroku"
   ],
-  "website": "https://t.me/OTPSentinelBot",
   "env": {
-    "IMSSMS_BOT_TOKEN": {
-      "description": "Your Telegram Bot Token from @BotFather",
+    "BOT_TOKEN": {
+      "description": "Telegram Bot Token",
       "required": true
     },
-    "IMSSMS_CHAT_IDS": {
-      "description": "Comma separated list of Telegram Chat IDs to receive OTPs",
+    "OWNER_ID": {
+      "description": "Telegram User ID of Bot Owner",
       "required": true
     },
-    "MANUAL_SESSION": {
-      "description": "PHPSESSID cookie from IMS SMS website (get from browser after login)",
+    "MONGO_DB_URI": {
+      "description": "MongoDB Atlas SRV Connection String",
       "required": true
     },
-    "BASE_URL": {
-      "description": "IMS SMS base URL",
-      "value": "https://imssms.org",
-      "required": false
-    },
-    "POLL_INTERVAL": {
-      "description": "How often to check for new OTPs (in seconds)",
-      "value": "15",
-      "required": false
+    "PHPSESSID": {
+      "description": "PHPSESSID cookie for INTS panel",
+      "required": true
     }
   },
   "formation": {
@@ -47,11 +36,6 @@
   "buildpacks": [
     {
       "url": "heroku/python"
-    }
-  ],
-  "addons": [
-    {
-      "plan": "heroku-redis:mini"
     }
   ]
 }
